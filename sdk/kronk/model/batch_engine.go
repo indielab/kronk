@@ -340,7 +340,32 @@ func (e *batchEngine) processBatch(ctx context.Context, buf []byte) {
 	// Continue prefill for text-only slots using round-robin allocation.
 	// Pull NUBatch tokens from each slot in turn to prevent one slot from
 	// starving others by consuming the entire tray.
+	//
+	// MTP correctness constraint: addPrefillChunk records a slot's pre-norm
+	// range as a single (targetBatchStart, targetBatchCount) tuple, which
+	// assumes the slot's rows in e.batch are contiguous. If two or more
+	// slots are prefilling and the outer loop runs a second pass, the
+	// rows of any one slot become interleaved with another slot's rows
+	// and the mirror step would copy the wrong pre-norm hidden states
+	// into the draft KV. To keep the recorded range contiguous, cap the
+	// outer loop at one pass when MTP is active and more than one slot
+	// is prefilling. Single-slot prefill keeps looping (rows are
+	// trivially contiguous), so single-request prefill throughput is
+	// unaffected.
 	chunkLimit := e.model.cfg.NUBatch()
+	mtpLimitOnePass := false
+	if mtpDraft {
+		nPrefillSlots := 0
+		for _, s := range e.slots {
+			if s.active && s.prefillTokens != nil {
+				nPrefillSlots++
+				if nPrefillSlots > 1 {
+					mtpLimitOnePass = true
+					break
+				}
+			}
+		}
+	}
 	for {
 		before := e.batch.NTokens
 		for _, s := range e.slots {
@@ -363,6 +388,12 @@ func (e *batchEngine) processBatch(ctx context.Context, buf []byte) {
 
 		// Stop when no tokens were added (all slots done or tray full).
 		if e.batch.NTokens == before {
+			break
+		}
+
+		// MTP multi-slot prefill: only one pass to keep each slot's rows
+		// contiguous in e.batch (see comment above).
+		if mtpLimitOnePass {
 			break
 		}
 	}
@@ -446,17 +477,51 @@ func (e *batchEngine) processBatch(ctx context.Context, buf []byte) {
 		return
 	}
 
-	// Verify speculative tokens or sample normally for each active slot.
+	// Post-decode is dispatched in up to three passes. Pass 1 is the
+	// universal "sample every non-spec slot" loop that runs in EVERY
+	// scenario (no drafter, separate-GGUF spec, single-slot MTP,
+	// multi-slot MTP). Passes 2A and 2B are spec-only — they are
+	// no-ops when no slot drafted this round, which is always the
+	// case for non-spec models.
+	//
+	// Pass 1 — Non-spec slots: optional MTP mirror (gated by
+	//          mtpDraft && s.mtpHasBatch && !s.mtpDisabledForRequest)
+	//          + processSlotToken. Sole post-decode work for non-spec
+	//          models. The target logit buffer is fully intact here.
+	//
+	// Pass 2A — Spec slots only (s.specDraftTokens != nil), Phase A
+	//          (verifySpeculativeTokens): read target logits, accept /
+	//          reject drafts, stream accepted drafts, sample the bonus
+	//          token. Strictly read-only on the target logit buffer.
+	//
+	// Pass 2B — Spec slots with s.specPendingFinalize, Phase B
+	//          (finalizeSpeculativeTokens): rollback (incl. hybrid
+	//          restore, which can wipe target logits), draft KV
+	//          rollback, MTP mirror, set s.nPast, stream bonus token.
+	//
+	// Why the 2A/2B split exists (the MTP + hybrid multi-slot fix):
+	// on a hybrid target (transformer + recurrent layers), a partial-
+	// rejection spec round runs restoreTargetSpecSnapshot in Phase B,
+	// which RE-DECODES the accepted prefix on the target context.
+	// That re-decode replaces the target's per-context logit buffer
+	// with logits for only the re-decoded rows — every other batch
+	// row's logits are invalidated. With nseq-max > 1, if one spec
+	// slot's Phase B ran before another spec slot's verify read its
+	// logits, the second slot would crash in llama_sampler_sample
+	// (GGML_ASSERT logits != nullptr at llama-sampler.cpp:850).
+	// Running every spec slot's Phase A first (Pass 2A) and every
+	// Phase B afterwards (Pass 2B) keeps multi-slot MTP + hybrid
+	// safe. Under nseq-max == 1 the ordering Phase A → Phase B for a
+	// single spec slot is functionally identical to the old
+	// monolithic verifySpeculativeTokens, so this split has no
+	// behavioral effect on the single-slot path.
+
+	// Pass 1: sample for all non-spec slots.
 	for _, s := range e.slots {
 		if !s.active {
 			continue
 		}
-
-		// Speculative path: verify draft tokens against target predictions.
-		// verifySpeculativeTokens (for MTP) also runs the post-verify
-		// mirror once the accepted count is known.
 		if s.specDraftTokens != nil {
-			e.verifySpeculativeTokens(s, buf)
 			continue
 		}
 
@@ -481,5 +546,33 @@ func (e *batchEngine) processBatch(ctx context.Context, buf []byte) {
 		}
 
 		e.processSlotToken(s, buf)
+	}
+
+	// Pass 2A: Phase A of speculative verification for every spec slot
+	// — read target logits, decide accept/reject, sample bonus token.
+	// Strictly read-only on the target context's logit buffer, so
+	// running this for all spec slots before any Phase B is safe.
+	for _, s := range e.slots {
+		if !s.active {
+			continue
+		}
+		if s.specDraftTokens == nil {
+			continue
+		}
+		e.verifySpeculativeTokens(s, buf)
+	}
+
+	// Pass 2B: Phase B of speculative verification — rollback, hybrid
+	// restore, draft KV rollback, MTP mirror, set s.nPast, stream the
+	// bonus token. finalizeSpeculativeTokens is a no-op for slots that
+	// short-circuited in Phase A (EOG) or that aren't pending.
+	for _, s := range e.slots {
+		if !s.active {
+			continue
+		}
+		if !s.specPendingFinalize {
+			continue
+		}
+		e.finalizeSpeculativeTokens(s, buf)
 	}
 }

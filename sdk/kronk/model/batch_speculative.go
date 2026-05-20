@@ -115,16 +115,24 @@ func (e *batchEngine) prefillDraft(ctx context.Context, s *slot) error {
 	return nil
 }
 
-// chooseNDraft returns the number of draft tokens to generate based on the
-// slot's acceptance rate EMA. When acceptance is low, drafting fewer tokens
-// (or none) avoids wasting GPU cycles on likely-rejected candidates.
+// chooseNDraft returns the number of draft tokens to generate based on
+// the slot's acceptance rate EMA. When acceptance is very low,
+// drafting nothing avoids paying for a draft forward pass + a verify
+// pass that is almost certainly going to reject — the caller's
+// generateDraftTokens / generateDraftTokensMTP both short-circuit on a
+// 0 return and fall through to a plain target decode for the round.
+//
+// The EMA is initialized to 1.0 at slot construction (see
+// batchEngine.newSlot) and PERSISTS across requests on the same slot,
+// so a long quiet streak with poor acceptance keeps draft overhead
+// low even when a new request begins on the same slot.
 func chooseNDraft(s *slot, maxDraft int) int {
 	switch {
-	case s.specAccEMA < 0.3:
+	case s.specAccEMA < 0.30:
+		return 0
+	case s.specAccEMA < 0.50:
 		return min(1, maxDraft)
-	case s.specAccEMA < 0.5:
-		return min(1, maxDraft)
-	case s.specAccEMA < 0.7:
+	case s.specAccEMA < 0.70:
 		return min(2, maxDraft)
 	case s.specAccEMA < 0.85:
 		return min(3, maxDraft)
@@ -256,21 +264,42 @@ func (e *batchEngine) generateDraftTokens(s *slot) []llama.Token {
 	return s.draftTokensBuf
 }
 
-// verifySpeculativeTokens implements the speculative sampling algorithm
-// (Leviathan et al., 2023). After the shared batch decode, it retrieves the
-// target model's probability distribution at each speculative position and
-// compares with the draft model's distribution.
+// verifySpeculativeTokens is Phase A of speculative verification — the
+// READ-ONLY pass that consumes the target context's logit buffer. It
+// implements the speculative sampling algorithm (Leviathan et al., 2023):
+// for each drafted position it reads target logits, decides accept /
+// reject, streams accepted drafts via handleSampledToken, and samples a
+// bonus token when all drafts are accepted. It does NOT mutate target
+// KV (no rollback / restore), does NOT mutate draft KV (no
+// rollbackDraft, no MTP mirror), and does NOT advance s.nPast — those
+// are deferred to finalizeSpeculativeTokens (Phase B).
 //
-// For each draft token x_i with draft probability q(x_i) and target
-// probability p(x_i):
-//   - Accept with probability min(1, p(x_i) / q(x_i))
-//   - On rejection: sample from the adjusted distribution max(0, p - q),
-//     normalized. This guarantees the output distribution exactly matches
-//     the target model, regardless of draft quality.
+// The split exists because Phase B's hybrid restoreTargetSpecSnapshot
+// re-decodes a small batch on the target context, which wipes the
+// per-context logit buffer for every other batch row. With nseq-max>1
+// and two spec slots in the same batch, the old monolithic verify
+// would let slot 0's Phase-B restore destroy slot 1's logits before
+// slot 1 had a chance to read them, crashing in llama_sampler_sample
+// (GGML_ASSERT logits != nullptr). Running every spec slot's read-only
+// Phase A first, THEN every slot's mutating Phase B, decouples those
+// stages safely.
 //
-// Accepted tokens are processed through handleSampledToken for streaming.
-// Rejected tokens are rolled back from both target and draft KV caches.
-// If all draft tokens are accepted, a bonus token is sampled from the target.
+// PRECONDITIONS
+//   - llama.Decode(target, batch) has just succeeded and the per-context
+//     logit buffer is intact for every slot's spec range.
+//
+// POSTCONDITIONS (on success)
+//   - s.specPendingFinalize == true and Phase B can run next.
+//   - s.specPendingAccepted / specPendingBonusToken /
+//     specPendingOriginalSampled hold the data Phase B needs.
+//   - s.specDraftTokens is RETAINED (Phase B clears it) so the rollback
+//     and hybrid re-decode in Phase B can read the original drafts.
+//   - s.specAccEMA has been updated for this round (via deferred update
+//     so EOG early-returns still apply it).
+//
+// On EOG mid-loop (handleSampledToken → finishSlot → reset) the
+// deferred EMA update fires, specPendingFinalize stays false, and
+// Phase B will skip the slot entirely.
 func (e *batchEngine) verifySpeculativeTokens(s *slot, buf []byte) {
 	draftTokens := s.specDraftTokens
 	draftProbs := s.specDraftProbs
@@ -318,8 +347,10 @@ func (e *batchEngine) verifySpeculativeTokens(s *slot, buf []byte) {
 	// the streaming pipeline actually emitted.
 	originalSampled := s.sampled
 
-	// Clear speculative state.
-	s.specDraftTokens = nil
+	// Clear sparse / probabilistic distributions — Phase B doesn't read
+	// them. specDraftTokens is RETAINED until Phase B because hybrid
+	// restoreTargetSpecSnapshot needs the original draft sequence to
+	// re-decode the accepted prefix.
 	s.specDraftProbs = nil
 	s.specDraftDistsSparse = nil
 
@@ -521,6 +552,65 @@ func (e *batchEngine) verifySpeculativeTokens(s *slot, buf []byte) {
 		}
 	}
 
+	// Phase A complete — stash everything Phase B needs and signal that
+	// finalizeSpeculativeTokens may run. Any earlier `return` (EOG via
+	// handleSampledToken) leaves specPendingFinalize=false so Phase B
+	// will skip this slot. specDraftTokens stays populated until Phase B
+	// clears it; hybrid restore needs the original draft sequence to
+	// re-decode the accepted prefix.
+	s.specPendingAccepted = accepted
+	s.specPendingBonusToken = bonusToken
+	s.specPendingOriginalSampled = originalSampled
+	s.specPendingFinalize = true
+}
+
+// finalizeSpeculativeTokens is Phase B of speculative verification — the
+// MUTATING pass that runs after every spec slot's Phase A has read its
+// target logits. It rolls back rejected draft positions from the
+// target and draft KV caches, restores the hybrid per-seq snapshot
+// when needed, mirrors the accepted prefix into the MTP draft KV,
+// advances s.nPast, and finally streams the bonus token sampled in
+// Phase A.
+//
+// PRECONDITIONS
+//   - Phase A (verifySpeculativeTokens) ran successfully and left
+//     s.specPendingFinalize == true. If the slot is no longer active
+//     or specPendingFinalize is false (EOG short-circuit in Phase A),
+//     this is a no-op.
+//   - s.specDraftTokens still holds the original drafted sequence —
+//     Phase A intentionally did not clear it.
+//
+// POSTCONDITIONS (on success)
+//   - Target KV holds exactly s.sampled + accepted draft tokens at
+//     positions [basePast .. basePast+accepted].
+//   - Draft KV is rolled back in lock-step.
+//   - For MTP: pendingH is refreshed via mirrorTargetBatchToMTPDraft.
+//   - s.nPast = basePast + 1 + accepted.
+//   - s.iBatch = -1.
+//   - All specPending* fields are cleared; s.specDraftTokens is nil.
+func (e *batchEngine) finalizeSpeculativeTokens(s *slot, buf []byte) {
+	if !s.specPendingFinalize {
+		return
+	}
+
+	accepted := s.specPendingAccepted
+	bonusToken := s.specPendingBonusToken
+	originalSampled := s.specPendingOriginalSampled
+	draftTokens := s.specDraftTokens
+	nDraft := len(draftTokens)
+	baseBatch := s.specBaseBatch
+	basePast := s.specBasePast
+	ctx := s.job.ctx
+
+	// Clear pending state up-front so any early return (including
+	// finishSlot inside the bonus-token handleSampledToken below)
+	// leaves the slot in a clean state.
+	s.specPendingFinalize = false
+	s.specPendingAccepted = 0
+	s.specPendingBonusToken = 0
+	s.specPendingOriginalSampled = 0
+	s.specDraftTokens = nil
+
 	// Roll back rejected draft positions from the target KV cache.
 	//
 	// Hybrid models (transformer + recurrent layers) need a state
@@ -534,9 +624,30 @@ func (e *batchEngine) verifySpeculativeTokens(s *slot, buf []byte) {
 	// For dense / pure-attention targets the simple MemorySeqRm path
 	// is used — much cheaper than a snapshot/restore + re-decode and
 	// fully correct because there is no recurrent state to rewind.
+	//
+	// NOTE: the hybrid restore path re-decodes a small batch on the
+	// target context, which invalidates the per-context logit buffer
+	// for every other slot's rows. That's safe here because we are in
+	// Pass 2B — every other spec slot has already completed its
+	// read-only Phase A and consumed its logits.
 	rollbackFrom := basePast + llama.Pos(1+accepted)
 	rollbackTo := basePast + llama.Pos(1+nDraft)
 	hybridRestore := e.model.modelInfo.Type == ModelTypeHybrid && len(s.specSnapshot) > 0 && rollbackFrom < rollbackTo
+	mtpActive := e.model.draft != nil && e.model.draft.mtp && s.mtpHasBatch && !s.mtpDisabledForRequest
+
+	// hybridRestoreRan is set true once restoreTargetSpecSnapshot has
+	// re-decoded the (sampledAtBase + accepted drafts) rebatch on the
+	// target context. After that re-decode, the target's per-context
+	// logit and pre-norm buffers are indexed against the REBATCH rows,
+	// not the original shared e.batch rows. The MTP mirror below uses
+	// s.targetBatchStart from the original e.batch, so running it
+	// after a restore would read the wrong pre-norm rows (the issue
+	// is benign only for slot 0 of a single-slot decode where
+	// baseBatch==0 and the indices happen to coincide; for any other
+	// layout it is corrupting). We therefore disable MTP for the rest
+	// of the request when restore ran, instead of trying to mirror
+	// against stale indices.
+	hybridRestoreRan := false
 
 	switch {
 	case hybridRestore:
@@ -550,6 +661,8 @@ func (e *batchEngine) verifySpeculativeTokens(s *slot, buf []byte) {
 			e.model.decodeMu.Lock()
 			llama.MemorySeqRm(e.model.mem, s.seqID, rollbackFrom, rollbackTo)
 			e.model.decodeMu.Unlock()
+		} else {
+			hybridRestoreRan = true
 		}
 
 	case rollbackFrom < rollbackTo:
@@ -558,7 +671,9 @@ func (e *batchEngine) verifySpeculativeTokens(s *slot, buf []byte) {
 		e.model.decodeMu.Unlock()
 	}
 
-	// Rollback draft KV to match.
+	// Rollback draft KV to match. For MTP this clears the ENTIRE
+	// drafted range (see rollbackDraft); the mirror below is then
+	// responsible for re-inserting the accepted prefix.
 	e.rollbackDraft(ctx, s, accepted, nDraft)
 
 	// MTP: mirror the accepted prefix [basePast..basePast+accepted]
@@ -567,14 +682,29 @@ func (e *batchEngine) verifySpeculativeTokens(s *slot, buf []byte) {
 	// the MTP draft wrote during generateDraftTokensMTP with the
 	// target-derived hidden states, and updates s.pendingH to
 	// h(basePast+accepted) for the next draft round.
-	if e.model.draft != nil && e.model.draft.mtp && s.mtpHasBatch && !s.mtpDisabledForRequest {
+	switch {
+	case mtpActive && hybridRestoreRan:
+		// The target's pre-norm buffer is now indexed against the
+		// rebatch decoded inside restoreTargetSpecSnapshot, not the
+		// original shared e.batch, so mirroring with s.targetBatchStart
+		// would read the wrong rows. Disable MTP for the remainder of
+		// the request and clear the draft seq so the slot continues
+		// target-only with a clean draft KV.
+		e.disableMTPForRequestSpec(ctx, s, "hybrid-restore", accepted)
+
+	case mtpActive:
 		if err := e.mirrorTargetBatchToMTPDraft(s, 1+accepted); err != nil {
+			// rollbackDraft above already removed the entire drafted
+			// range from the draft KV; a failed mirror leaves the
+			// accepted prefix missing from the draft seq and there is
+			// no later step that can reconstruct it (a subsequent
+			// single-token gen mirror cannot rebuild the prefix).
+			// Disable MTP for the remainder of the request and clear
+			// the draft seq so the slot continues target-only with a
+			// clean draft KV.
 			e.model.log(ctx, "speculative", "status", "mtp-mirror-error",
 				"slot", s.id, "accepted", accepted, "err", err)
-			// Fall through: clear mtpHasBatch and let the next iteration
-			// start fresh. The slot's draft KV may be in a partially
-			// updated state; the next prefill or gen mirror will resync.
-			s.mtpHasBatch = false
+			e.disableMTPForRequestSpec(ctx, s, "mirror-error", accepted)
 		}
 	}
 
@@ -585,22 +715,22 @@ func (e *batchEngine) verifySpeculativeTokens(s *slot, buf []byte) {
 	// line carries the per-request rollup, so steady-state INFO output
 	// only needs a periodic summary to show acceptance drift and
 	// nPast progression. First round is always logged so the start of
-	// each request is anchored; afterwards every 32 rounds.
+	// each request is anchored; afterwards every 32 rounds. The EMA
+	// was already updated by Phase A's deferred update, so s.specAccEMA
+	// reflects this round when logged.
 	s.specRounds++
 	if s.specRounds == 1 || s.specRounds%32 == 0 {
-		// Compute the EMA value as it will be after the deferred update
-		// so the logged trend reflects the round we just completed.
-		emaAfter := s.specAccEMA
-		if nDraft > 0 {
-			emaAfter = 0.9*s.specAccEMA + 0.1*(float64(accepted)/float64(nDraft))
-		}
 		e.model.log(ctx, "speculative", "status", "verify-done",
 			"slot", s.id, "round", s.specRounds, "accepted", accepted, "nDraft", nDraft,
 			"target_nPast", s.nPast, "draft_nPast", s.draftNPast,
-			"acc_ema", fmt.Sprintf("%.2f", emaAfter))
+			"acc_ema", fmt.Sprintf("%.2f", s.specAccEMA))
 	}
 
-	// Process the bonus token through the streaming pipeline.
+	// Process the bonus token through the streaming pipeline. For the
+	// hybrid restore path above, restoreTargetSpecSnapshot's re-decode
+	// marked logits=true only on the last re-decoded position
+	// (basePast+accepted) — which is exactly the bonus token's iBatch
+	// position — so logprob extraction at this site still works.
 	e.handleSampledToken(s, bonusToken, baseBatch+int32(accepted), buf)
 
 	if !s.active {
@@ -849,4 +979,40 @@ func (e *batchEngine) rollbackDraft(ctx context.Context, s *slot, accepted, nDra
 		"slot", s.id, "accepted", accepted, "nDraft", nDraft,
 		"draft_base", draftBasePast, "draft_keep", draftKeep,
 		"draft_kv_end", draftKVEnd, "draft_nPast", s.draftNPast)
+}
+
+// disableMTPForRequestSpec disables MTP for the remainder of the
+// current request after a speculative-finalize step left the draft
+// state inconsistent with the target. Called from finalizeSpeculativeTokens
+// on two paths:
+//
+//   - hybrid restore success: restoreTargetSpecSnapshot re-decoded a
+//     small rebatch on the target context, so the target's pre-norm
+//     and logit buffers are indexed against the rebatch rather than
+//     the original shared e.batch — the mirror would read wrong rows.
+//
+//   - post-rollback mirror failure: rollbackDraft already cleared the
+//     entire drafted range from the draft KV, and no later step in
+//     the request can reconstruct the missing accepted prefix.
+//
+// In both cases we wipe the draft seq (so the slot's draft KV is
+// clean), reset draft state, set mtpDisabledForRequest, and let the
+// slot continue target-only for the rest of the request. The slot
+// reset at the next finishSlot clears mtpDisabledForRequest so the
+// next request on this slot can use MTP again.
+func (e *batchEngine) disableMTPForRequestSpec(ctx context.Context, s *slot, reason string, accepted int) {
+	draft := e.model.draft
+
+	llama.MemorySeqRm(draft.mem, s.seqID, -1, -1)
+	s.draftNPast = 0
+	if len(s.draftCachedTokens) > 0 {
+		s.draftCachedTokens = s.draftCachedTokens[:0]
+	}
+	s.pendingH = s.pendingH[:0]
+	s.mtpHasBatch = false
+	s.mtpDisabledForRequest = true
+	s.mtpDisableReason = reason
+
+	e.model.log(ctx, "speculative", "status", "mtp-disabled-"+reason,
+		"slot", s.id, "accepted", accepted)
 }

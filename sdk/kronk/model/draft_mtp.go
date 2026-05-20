@@ -64,20 +64,16 @@ func loadDraftModelMTP(ctx context.Context, log applog.Logger, targetCtx llama.C
 
 	// Build context params for the MTP draft context. We inherit thread
 	// layout, KV cache types, and offload behavior from the target so
-	// the MTP head runs on the same backend. NCtx / NBatch / NUbatch
-	// are inherited so the drafter can score the same prompts the
-	// target sees. NSeqMax is forced to 1 — MTP+multi-slot triggers a
-	// GGML_ASSERT(logits != nullptr) in llama_sampler_sample on the
-	// shared-batch decode that mixes one slot's MTP spec tokens with
-	// another slot's fresh prefill. The caller (selectAndLoadDraft)
-	// also gates MTP on the target being NSeqMax==1; this is a
-	// belt-and-suspenders setting.
+	// the MTP head runs on the same backend. NCtx / NBatch / NUbatch /
+	// NSeqMax are inherited so the drafter can host the same number of
+	// concurrent sequences the target serves and score the same prompts
+	// the target sees.
 	params := llama.ContextDefaultParams()
 	params.CtxType = llama.ContextTypeMTP
 	params.NCtx = targetCtxParams.NCtx
 	params.NBatch = targetCtxParams.NBatch
 	params.NUbatch = targetCtxParams.NUbatch
-	params.NSeqMax = 1
+	params.NSeqMax = targetCtxParams.NSeqMax
 	params.NThreads = targetCtxParams.NThreads
 	params.NThreadsBatch = targetCtxParams.NThreadsBatch
 	params.FlashAttentionType = targetCtxParams.FlashAttentionType
@@ -151,12 +147,15 @@ func loadDraftModelMTP(ctx context.Context, log applog.Logger, targetCtx llama.C
 	// batch and prefillBatch remain zero because MTP doesn't use them,
 	// but they're kept allocated for type-uniformity with the
 	// separate-GGUF draft (BatchFree on a zero struct is harmless).
-	nVocab := int(llama.VocabNTokens(llama.ModelGetVocab(targetModel)))
-
-	draftProbs := make([][]float32, nDraft)
-	for i := range draftProbs {
-		draftProbs[i] = make([]float32, nVocab)
-	}
+	//
+	// Note: draftBuf, draftProbs, targetProbs, and adjusted are
+	// intentionally left nil/empty for MTP. verifySpeculativeTokens
+	// forces greedy verification on the MTP path (the MTP head does
+	// not produce per-token distributions), so the probabilistic
+	// sampling branches that read those buffers are unreachable. The
+	// lazy sortIndices / filterBuf scratch buffers stay zero for the
+	// same reason. Skipping the full-vocab allocations avoids ~1-2 MB
+	// of unused memory per drafter on large-vocab models.
 
 	// Construct the *draftModel BEFORE pinning so the runtime.Pinner
 	// fields stay at their final addresses. runtime.Pinner is invalid
@@ -180,10 +179,6 @@ func loadDraftModelMTP(ctx context.Context, log applog.Logger, targetCtx llama.C
 		draftEmbdSlice:  make([]float32, nEmbd),
 		mirrorEmbdSlice: make([]float32, int(params.NBatch)*nEmbd),
 		nDraft:          nDraft,
-		draftBuf:        make([]llama.Token, 0, nDraft),
-		draftProbs:      draftProbs,
-		targetProbs:     make([]float32, nVocab),
-		adjusted:        make([]float32, nVocab),
 	}
 
 	// Pin the Go-owned embd buffers and attach them to the batches.
@@ -242,13 +237,6 @@ func selectAndLoadDraft(ctx context.Context, log applog.Logger, cfg Config, targ
 	if !MTPAvailable() {
 		log(ctx, "draft-model-mtp", "status", "auto-detect-skipped",
 			"reason", "llama library does not export pre-norm hidden-state APIs (llama_set_embeddings_pre_norm / llama_get_embeddings_pre_norm / _ith); upgrade llama.cpp to a build that includes src/llama-ext.h")
-		return nil, nil
-	}
-
-	if targetCtxParams.NSeqMax > 1 {
-		log(ctx, "draft-model-mtp", "status", "auto-detect-skipped",
-			"reason", "MTP requires nseq-max=1, target is multi-slot",
-			"target-nseq-max", targetCtxParams.NSeqMax)
 		return nil, nil
 	}
 

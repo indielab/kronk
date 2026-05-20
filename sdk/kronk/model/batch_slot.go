@@ -193,8 +193,22 @@ type slot struct {
 	// target KV — there is no draft snapshot. Running MTP against an
 	// empty (or partial) draft context produces near-zero acceptance
 	// for the whole request, which is worse than no speculation.
-	// Cleared in slot.reset().
+	// Also set inside finalizeSpeculativeTokens after a hybrid restore
+	// re-decode or a post-rollback mirror failure. Cleared in
+	// slot.reset().
 	mtpDisabledForRequest bool
+
+	// mtpDisableReason is a short, machine-friendly label describing
+	// why MTP was disabled for the current request. Surfaced in the
+	// final per-request Usage block (DraftDisableReason) and the
+	// chat-completion log line so an operator can immediately see why
+	// a request with a high DMAR also had low draft coverage. Empty
+	// while MTP is still active. Cleared in slot.reset(). Possible
+	// values mirror the speculative-log status names:
+	//   "imc-hit"          — IMC cache hit at startSlot.
+	//   "hybrid-restore"   — post-restore mirror would read stale rows.
+	//   "mirror-error"     — post-verify mirror failed; draft KV wiped.
+	mtpDisableReason string
 
 	// specSnapshot holds a snapshot of the target context's per-sequence
 	// state taken right before a speculative batch is decoded. It is
@@ -211,6 +225,24 @@ type slot struct {
 	// scales with current KV occupancy. Length is reset to the actual
 	// snapshot bytes; cap is retained across requests.
 	specSnapshot []byte
+
+	// Pending-finalize fields populated by Phase A of speculative verify
+	// (verifySpeculativeTokens) and consumed by Phase B
+	// (finalizeSpeculativeTokens). The split exists because Phase B may
+	// re-decode on the target context (hybrid restoreTargetSpecSnapshot),
+	// which wipes the per-context logit buffer for every other slot's
+	// rows. Running all spec slots through Phase A first lets every slot
+	// read its logits before any restore mutates them; then a second
+	// pass runs the per-slot Phase B in any order.
+	//
+	// specPendingFinalize gates Phase B. It is true between a successful
+	// Phase A and the matching Phase B. EOG inside Phase A returns
+	// without setting it, so Phase B is skipped for finished slots.
+	// Cleared at the top of Phase B and by slot.reset().
+	specPendingFinalize        bool
+	specPendingAccepted        int
+	specPendingBonusToken      llama.Token
+	specPendingOriginalSampled llama.Token
 
 	// Sparse candidate-based speculative decoding fields.
 	draftSampler         llama.Sampler            // Per-slot sampler for draft model (non-greedy)
@@ -265,6 +297,10 @@ func (s *slot) reset() {
 	s.specDraftedTotal = 0
 	s.specAcceptedTotal = 0
 	s.specRounds = 0
+	s.specPendingFinalize = false
+	s.specPendingAccepted = 0
+	s.specPendingBonusToken = 0
+	s.specPendingOriginalSampled = 0
 	s.draftTokensBuf = s.draftTokensBuf[:0]
 	// Note: draftCachedTokens persists across requests for incremental draft KV reuse.
 
@@ -279,6 +315,7 @@ func (s *slot) reset() {
 	s.targetBatchBasePos = 0
 	s.mtpHasBatch = false
 	s.mtpDisabledForRequest = false
+	s.mtpDisableReason = ""
 	if s.draftSampler != 0 {
 		llama.SamplerFree(s.draftSampler)
 		s.draftSampler = 0
