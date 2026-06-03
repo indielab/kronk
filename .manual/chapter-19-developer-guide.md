@@ -160,10 +160,10 @@ A fresh checkout that skips `install-gotooling` will fail the `lint` and
 
 The repo carries two Go-version files with different roles:
 
-| File           | Role                                                              | Value          |
-| -------------- | ----------------------------------------------------------------- | -------------- |
-| [`go.mod`](../go.mod)      | Minimum language version. Floor for downstream consumers.         | `go 1.26.0`    |
-| [`.go-version`](../.go-version) | Exact toolchain CI / dev managers install (asdf, mise, goenv, gvm, direnv). | `1.26.3`       |
+| File                            | Role                                                                        | Value       |
+|---------------------------------|-----------------------------------------------------------------------------|-------------|
+| [`go.mod`](../go.mod)           | Minimum language version. Floor for downstream consumers.                   | `go 1.26.0` |
+| [`.go-version`](../.go-version) | Exact toolchain CI / dev managers install (asdf, mise, goenv, gvm, direnv). | `1.26.4`    |
 
 They are allowed to differ on the *patch* component but must agree on
 `<major>.<minor>`. The Linux + Release workflows run
@@ -1895,7 +1895,7 @@ Five GitHub Actions workflows live under [`.github/workflows/`](../.github/workf
 | -------------------- | ---------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | [`linux.yml`](../.github/workflows/linux.yml)             | PRs + push to `main` (Go/mod/CI paths)                     | Three parallel jobs: `static` (vet/staticcheck/govulncheck/gofmt/gofix/tidy/goreleaser-check/-race unit tests), `api-tests` (`cmd/server/...`), `sdk-tests` (`sdk/...`). |
 | [`release.yaml`](../.github/workflows/release.yaml)       | Push of tag `v*`                                           | Pinned-toolchain `goreleaser release --clean`, SBOM generation via syft, SLSA build-provenance attestation, Homebrew cask refresh.                     |
-| [`docker.yml`](../.github/workflows/docker.yml)           | PRs, push to `main`, push of tag `v*`, `workflow_dispatch` | Builds (and on push: publishes + cosign-signs) the **five** container variants defined in [`zarf/docker/kronk/Dockerfile`](../zarf/docker/kronk/Dockerfile). |
+| [`docker.yml`](../.github/workflows/docker.yml)           | PRs, push to `main`, push of tag `v*`, `workflow_dispatch` | Builds the **five** container variants defined in [`zarf/docker/kronk/Dockerfile`](../zarf/docker/kronk/Dockerfile). Only tag pushes (`v*`) publish + cosign-sign; main pushes build all variants for CI validation (and smoke-test cpu/amd64) but do not push to any registry. |
 | [`cache-cleanup.yml`](../.github/workflows/cache-cleanup.yml) | Daily cron + manual                                        | Prunes stale GHA cache entries and stale `kronk-buildcache` GHCR tags older than the cutoff.                                                            |
 | [`label-guard.yml`](../.github/workflows/label-guard.yml) | Label events on PRs/issues                                 | Removes unauthorized `build *` labels (PRs from non-maintainers; any application on an issue).                                                          |
 
@@ -1917,7 +1917,7 @@ Two files, two roles:
                       and by `GOTOOLCHAIN=auto` resolution
 
 ╭──────────────╮      exact toolchain CI + dev managers install
-│ .go-version  │ ───► `1.26.3`
+│ .go-version  │ ───► `1.26.4`
 ╰──────────────╯      picked up by asdf, mise, goenv, gvm, direnv,
                       and actions/setup-go's `go-version-file:` input
 ```
@@ -2180,17 +2180,26 @@ into `path/` with no subdir. Flattening unconditionally makes the
 layout uniform and is collision-free because filenames are unique
 digests.
 
-**Merge + sign.** The `merge` job per variant:
+**Merge + sign.** The `merge` job per variant (tag pushes only — main
+pushes never reach this job):
 
 1. Downloads the per-registry digest artifacts for its variant.
 2. Stitches the multi-arch manifest with `docker buildx imagetools
    create -t <image>:<tag> <image>@sha256:<arch1>...` against both
-   registries independently.
-3. Signs every published `<registry>:<tag>` with **cosign keyless**
-   (OIDC). `id-token: write` is granted on this job only; cosign
-   exchanges the workflow's OIDC token for a short-lived Fulcio cert
-   tied to the workflow identity, signs the manifest, and records the
-   signature + Rekor log entry.
+   registries independently. The first invocation per registry uses
+   `--metadata-file` so the resulting manifest-list digest can be
+   captured deterministically (no read-after-write inspect).
+3. Signs **once per (registry, manifest-list digest)** with **cosign
+   keyless** (OIDC) using `--recursive` (which walks the index and
+   signs each per-arch child too). `id-token: write` is granted on
+   this job only; cosign exchanges the workflow's OIDC token for a
+   short-lived Fulcio cert tied to the workflow identity and records
+   the signature + Rekor log entry. Signing by digest (rather than
+   once per tag) collapses N tags-of-the-same-content into a single
+   signature — a tag release produces `<version>-<variant>`,
+   `latest-<variant>` and (cpu only) `latest`, all pointing at the
+   same digest. Consumers verify by tag as usual; cosign resolves
+   the tag to a digest at verify time.
 
    - **GHCR** signatures are stored co-located with the image
      (default cosign layout).
@@ -2228,10 +2237,10 @@ digests.
 
 | Event                  | Variants                                                  | Push? | Tags applied                                                              |
 | ---------------------- | --------------------------------------------------------- | ----- | ------------------------------------------------------------------------- |
-| PR (no labels)         | `cpu`                                                     | no    | — (plus a `kronk --version` / `kronk --help` smoke test on cpu/amd64)     |
-| PR + label `build all` | all 5                                                     | no    | —                                                                         |
-| PR + label `build <v>` | `cpu` + each labeled variant                              | no    | —                                                                         |
-| Push to `main`         | all 5                                                     | yes   | `main-<shortsha>-<variant>` (cosign-signed)                               |
+| PR (no labels)         | `cpu` (linux/amd64 only)                                  | no    | — (plus a `kronk --version` / `kronk --help` smoke test on cpu/amd64)     |
+| PR + label `build all` | all 5 (all supported arches)                              | no    | —                                                                         |
+| PR + label `build <v>` | `cpu` + each labeled variant (all supported arches)       | no    | —                                                                         |
+| Push to `main`         | all 5                                                     | no    | — (smoke-tests cpu/amd64; refreshes the registry-backed BuildKit cache)   |
 | Push to tag `v*`       | all 5                                                     | yes   | `<tag>-<variant>` + `latest-<variant>`; plus `latest` → cpu (all signed)  |
 | `workflow_dispatch`    | input `variants` (default `all`, or comma-separated)      | no    | —                                                                         |
 
