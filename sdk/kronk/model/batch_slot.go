@@ -38,9 +38,15 @@ type chatJob struct {
 
 	imcSession      *imcSession // Matched IMC session (the session-pool entry whose KV state will be restored into the assigned slot)
 	imcSessionMedia bool        // True if session has media (snapshot at job creation; safe to read without lock)
-	imcSlotID       int         // Session-pool index (== imcSession.slotID); used by imcClearPending lookup and log correlation
+	imcSessionID    int         // Session-pool index (== imcSession.id); used by imcClearPending lookup and log correlation. Not related to execution slot identity.
 	imcCacheHit     bool        // True if conversation history was found in cache
 	imcExpectedHash string      // Expected cachedMsgsHash for stale detection at startSlot (a concurrent extend may have moved the session forward between processIMC and startSlot)
+
+	// Pure-hit snapshot-skip state mirrored from cacheResult.
+	imcExpectedCachedMsgs  int    // Expected cachedMsgCount at startSlot.
+	imcExpectedTokens      int    // Expected totalTokensCached at startSlot.
+	imcExpectedRenderHash  string // Expected cachedRenderInputHash at startSlot (carried forward on builds/extends so commit can refresh the session field).
+	imcPureHitSkipSnapshot bool   // True when startSlot may skip the post-restore snapshot.
 
 	// IMC dedicated slot fields.
 	imcNewCacheTokens    []llama.Token // New tokens to extend the cache in the slot's sequence
