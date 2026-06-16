@@ -21,6 +21,7 @@ import (
 	"github.com/ardanlabs/kronk/sdk/kronk/observ/otel"
 	"github.com/ardanlabs/kronk/sdk/kronk/vram"
 	"github.com/ardanlabs/kronk/sdk/tools/defaults"
+	"github.com/ardanlabs/kronk/sdk/tools/devices"
 	"github.com/hybridgroup/yzma/pkg/llama"
 	"github.com/hybridgroup/yzma/pkg/mtmd"
 	"go.opentelemetry.io/otel/attribute"
@@ -378,9 +379,11 @@ type modelParamsKeepalive struct {
 	tensorBuft  []llama.TensorBuftOverride
 }
 
-// buildModelParams translates Config into llama.ModelParams. It mutates
+// buildModelParams translates Config into llama.ModelParams. It mutates cfg
+// (passed by pointer so the changes are visible to the caller): it fills
 // cfg.TensorBuftOverrides when MoE compilation produces an implicit override
-// list, so the caller passes cfg by pointer to keep that change visible.
+// list, and writes the resolved cfg.PtrSplitMode back when none was set so
+// ModelConfig() reports the effective device-aware split mode.
 func buildModelParams(ctx context.Context, cfg *Config, l applog.Logger) (llama.ModelParams, modelParamsKeepalive, error) {
 	mParams := llama.ModelDefaultParams()
 	var ka modelParamsKeepalive
@@ -411,11 +414,22 @@ func buildModelParams(ctx context.Context, cfg *Config, l applog.Logger) (llama.
 	}
 
 	// Set split mode for multi-GPU and tensor parallelism (expert-parallel for MoE).
-	// Default to SplitModeRow (tensor parallelism) when not explicitly configured,
-	// as it provides the best performance for MoE models and works well for dense models.
+	// When not explicitly configured, fall back to a device-count aware default
+	// (DefaultSplitMode): SplitModeRow only with multiple GPUs, otherwise
+	// SplitModeLayer. This is the universal floor every load path shares, so it
+	// protects callers (including direct SDK users) that never run the hardware
+	// analysis. Tensor parallelism on a single GPU is a no-op that performs
+	// worse and crashes MoE models with view tensors (e.g. gemma4).
 	switch cfg.PtrSplitMode {
 	case nil:
-		mParams.SplitMode = SplitModeRow.ToYZMAType()
+		split := DefaultSplitMode(gpuDeviceCount(cfg))
+		mParams.SplitMode = split.ToYZMAType()
+		// Surface the resolved split mode back into cfg so ModelConfig() reports
+		// the effective value ("layer"/"row") instead of nil. This keeps
+		// diagnostics honest whether or not auto-tune ran, and confirms tensor
+		// parallelism is never silently used on a single GPU.
+		cfg.PtrSplitMode = &split
+		l(ctx, "BUILD-MODEL-PARAMS", "split_mode", "resolved", split.String())
 	default:
 		mParams.SplitMode = (*cfg.PtrSplitMode).ToYZMAType()
 	}
@@ -1248,6 +1262,28 @@ func resolveBackendDevice(name string) llama.GGMLBackendDevice {
 	}
 
 	return 0
+}
+
+// gpuDeviceCount reports how many GPU devices the model will load across. When
+// the config pins an explicit device list, only its GPU entries are counted;
+// otherwise llama.cpp uses every available device, so all enumerated GPUs are
+// counted. It is used to pick the device-count aware split-mode default.
+func gpuDeviceCount(cfg *Config) int {
+	if len(cfg.Devices) > 0 {
+		n := 0
+		for _, name := range cfg.Devices {
+			if !strings.EqualFold(strings.TrimSpace(name), "CPU") {
+				n++
+			}
+		}
+		return n
+	}
+
+	return devices.List(
+		devices.WithIncludeCPU(false),
+		devices.WithIncludeUnknown(false),
+		devices.WithIncludeMemory(false),
+	).GPUCount
 }
 
 // resolveBackendDevices resolves a list of device names to ggml backend device

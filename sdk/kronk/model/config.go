@@ -98,7 +98,7 @@ func float32Or(p *float32, def float32) float32 {
 // separate-GGUF drafter wins even on a target that also has an MTP head.
 type DraftModelConfig struct {
 	ModelFiles    []string  // Path to the draft model GGUF file(s); empty means MTP nDraft override
-	NDraft        int       // Number of tokens to draft per step (separate-GGUF default 5, MTP default 4)
+	NDraft        int       // Number of tokens to draft per step (separate-GGUF default 5, MTP default 2)
 	PtrNGpuLayers *int      // GPU layers for draft model (nil = all layers on GPU)
 	Devices       []string  // Devices for draft model (e.g., ["CUDA0"])
 	PtrMainGPU    *int      // Primary GPU index for draft model
@@ -116,6 +116,14 @@ func (d DraftModelConfig) IsSeparate() bool { return len(d.ModelFiles) > 0 }
 // Config represents model level configuration. These values if configured
 // incorrectly can cause the system to panic. The defaults are used when these
 // values are set to 0.
+//
+// AutoTune, when true, asks kronk.New to run a hardware-aware analysis of the
+// model (architecture, size, and available devices) and seed unset settings
+// (context window, KV cache type, slots, flash attention, split mode, etc.)
+// before loading. It is off by default for backwards compatibility, and any
+// option the caller sets explicitly always wins over the analysis. It has no
+// effect when using the low-level model package directly (only kronk.New
+// applies it).
 //
 // CacheMinTokens sets the minimum token count required before caching. Messages
 // shorter than this threshold are not cached, as the overhead of cache management
@@ -274,9 +282,12 @@ func (d DraftModelConfig) IsSeparate() bool { return len(d.ModelFiles) > 0 }
 //   - SplitModeNone (0): single GPU
 //   - SplitModeLayer (1): split layers and KV across GPUs
 //   - SplitModeRow (2): split layers and KV across GPUs with tensor parallelism
-//     (recommended for MoE models like Qwen3-MoE, Mixtral, DeepSeek)
+//     (recommended for multi-GPU MoE models like Qwen3-MoE, Mixtral, DeepSeek)
 //
-// When nil (not set), defaults to SplitModeRow for optimal MoE performance.
+// When nil (not set), the default is device-count aware (see DefaultSplitMode):
+// SplitModeRow only when more than one GPU is present, otherwise SplitModeLayer.
+// Tensor parallelism on a single GPU is a no-op that performs worse and can
+// crash MoE models with view tensors (e.g. gemma4).
 //
 // TensorBuftOverrides is a list of tensor buffer type override patterns that
 // force matching tensors to execute on CPU instead of GPU. This is an expert-level
@@ -321,6 +332,7 @@ func (d DraftModelConfig) IsSeparate() bool { return len(d.ModelFiles) > 0 }
 // YarnOrigCtx sets the original training context size for YaRN scaling. When nil
 // or 0, uses the model's native training context length from metadata.
 type Config struct {
+	AutoTune             bool
 	PtrCacheMinTokens    *int
 	PtrCacheSlotTimeout  *int
 	CacheTypeK           GGMLType
@@ -1156,6 +1168,25 @@ func (s SplitMode) ToYZMAType() llama.SplitMode {
 	return llama.SplitMode(s)
 }
 
+// DefaultSplitMode returns the split mode to use when the user has not set one
+// explicitly, given the number of GPU devices the model will load across. It is
+// the single source of truth for this decision: both the in-load default
+// (buildModelParams) and the hardware analysis (analyzeModel) call it so they
+// can never disagree.
+//
+// SplitModeRow (tensor parallelism) is only meaningful with two or more GPUs.
+// On a single GPU it is a no-op that still activates llama.cpp's CUDA
+// split-buffer path, which both performs worse than SplitModeLayer and crashes
+// on MoE models whose graphs contain view tensors (e.g. gemma4). So we default
+// to SplitModeRow only for multi-GPU and SplitModeLayer otherwise, matching
+// llama.cpp's own single-GPU default.
+func DefaultSplitMode(gpuCount int) SplitMode {
+	if gpuCount > 1 {
+		return SplitModeRow
+	}
+	return SplitModeLayer
+}
+
 func (s SplitMode) MarshalYAML() (any, error) {
 	return s.String(), nil
 }
@@ -1407,6 +1438,7 @@ func NewConfig(opts ...Option) Config {
 }
 
 func WithConfig(src Config) Option                   { return func(c *Config) { *c = src } }
+func WithAutoTune(v bool) Option                     { return func(c *Config) { c.AutoTune = v } }
 func WithCacheMinTokens(v int) Option                { return func(c *Config) { c.PtrCacheMinTokens = new(v) } }
 func WithCacheSlotTimeout(v int) Option              { return func(c *Config) { c.PtrCacheSlotTimeout = new(v) } }
 func WithCacheTypeK(v GGMLType) Option               { return func(c *Config) { c.CacheTypeK = v } }

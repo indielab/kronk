@@ -106,6 +106,7 @@ func newKronk(mp models.Path) (*kronk.Kronk, error) {
 	krn, err := kronk.New(
 		model.WithModelFiles(mp.ModelFiles),
 		model.WithProjFile(mp.ProjFile),
+		model.WithAutoTune(true),
 		model.WithIncrementalCache(false),
 		model.WithContextWindow(8*1024),
 		model.WithNSeqMax(2),
@@ -155,6 +156,11 @@ func printModelInfo(krn *kronk.Kronk) {
 		fmt.Println("- nGPULayers     :", *n)
 	} else {
 		fmt.Println("- nGPULayers     : all")
+	}
+	if sm := cfg.PtrSplitMode; sm != nil {
+		fmt.Println("- splitMode      :", sm)
+	} else {
+		fmt.Println("- splitMode      : auto")
 	}
 }
 

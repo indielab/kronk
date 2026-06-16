@@ -442,6 +442,7 @@ func newKronk(mp models.Path) (*kronk.Kronk, error) {
 
 	krn, err := kronk.New(
 		model.WithModelFiles(mp.ModelFiles),
+		model.WithAutoTune(true),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("unable to create inference model: %w", err)
@@ -471,6 +472,11 @@ func newKronk(mp models.Path) (*kronk.Kronk, error) {
 		fmt.Println("- nGPULayers     :", *n)
 	} else {
 		fmt.Println("- nGPULayers     : all")
+	}
+	if sm := krn.ModelConfig().PtrSplitMode; sm != nil {
+		fmt.Println("- splitMode      :", sm)
+	} else {
+		fmt.Println("- splitMode      : auto")
 	}
 
 	return krn, nil
@@ -578,6 +584,7 @@ func newKronk(mp models.Path) (*kronk.Kronk, error) {
 	krn, err := kronk.New(
 		model.WithModelFiles(mp.ModelFiles),
 		model.WithProjFile(mp.ProjFile),
+		model.WithAutoTune(true),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("unable to create inference model: %w", err)
@@ -607,6 +614,11 @@ func newKronk(mp models.Path) (*kronk.Kronk, error) {
 		fmt.Println("- nGPULayers     :", *n)
 	} else {
 		fmt.Println("- nGPULayers     : all")
+	}
+	if sm := krn.ModelConfig().PtrSplitMode; sm != nil {
+		fmt.Println("- splitMode      :", sm)
+	} else {
+		fmt.Println("- splitMode      : auto")
 	}
 
 	return krn, nil
@@ -1514,6 +1526,7 @@ func newKronk(mp models.Path) (*kronk.Kronk, error) {
 
 	krn, err := kronk.New(
 		model.WithModelFiles(mp.ModelFiles),
+		model.WithAutoTune(true),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("unable to create inference model: %w", err)
@@ -1543,6 +1556,11 @@ func newKronk(mp models.Path) (*kronk.Kronk, error) {
 		fmt.Println("- nGPULayers     :", *n)
 	} else {
 		fmt.Println("- nGPULayers     : all")
+	}
+	if sm := krn.ModelConfig().PtrSplitMode; sm != nil {
+		fmt.Println("- splitMode      :", sm)
+	} else {
+		fmt.Println("- splitMode      : auto")
 	}
 
 	return krn, nil
@@ -1873,6 +1891,7 @@ func newKronk(mp models.Path) (*kronk.Kronk, error) {
 	krn, err := kronk.New(
 		model.WithModelFiles(mp.ModelFiles),
 		model.WithProjFile(mp.ProjFile),
+		model.WithAutoTune(true),
 		model.WithIncrementalCache(false),
 		model.WithContextWindow(8*1024),
 		model.WithNSeqMax(2),
@@ -1922,6 +1941,11 @@ func printModelInfo(krn *kronk.Kronk) {
 		fmt.Println("- nGPULayers     :", *n)
 	} else {
 		fmt.Println("- nGPULayers     : all")
+	}
+	if sm := cfg.PtrSplitMode; sm != nil {
+		fmt.Println("- splitMode      :", sm)
+	} else {
+		fmt.Println("- splitMode      : auto")
 	}
 }
 
@@ -2145,6 +2169,7 @@ func newKronk(mp models.Path) (*kronk.Kronk, error) {
 
 	krn, err := kronk.New(
 		model.WithModelFiles(mp.ModelFiles),
+		model.WithAutoTune(true),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("unable to create inference model: %w", err)
@@ -2175,6 +2200,11 @@ func newKronk(mp models.Path) (*kronk.Kronk, error) {
 		fmt.Println("- nGPULayers     :", *n)
 	} else {
 		fmt.Println("- nGPULayers     : all")
+	}
+	if sm := krn.ModelConfig().PtrSplitMode; sm != nil {
+		fmt.Println("- splitMode      :", sm)
+	} else {
+		fmt.Println("- splitMode      : auto")
 	}
 
 	return krn, nil
@@ -2333,6 +2363,7 @@ func newKronk(mp models.Path) (*kronk.Kronk, error) {
 
 	krn, err := kronk.New(
 		model.WithModelFiles(mp.ModelFiles),
+		model.WithAutoTune(true),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("unable to create inference model: %w", err)
@@ -2362,6 +2393,11 @@ func newKronk(mp models.Path) (*kronk.Kronk, error) {
 		fmt.Println("- nGPULayers     :", *n)
 	} else {
 		fmt.Println("- nGPULayers     : all")
+	}
+	if sm := krn.ModelConfig().PtrSplitMode; sm != nil {
+		fmt.Println("- splitMode      :", sm)
+	} else {
+		fmt.Println("- splitMode      : auto")
 	}
 
 	return krn, nil
@@ -2903,6 +2939,7 @@ func newKronk(mp models.Path) (*kronk.Kronk, error) {
 
 	krn, err := kronk.New(
 		model.WithModelFiles(mp.ModelFiles),
+		model.WithAutoTune(true),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("unable to create inference model: %w", err)
@@ -2932,6 +2969,11 @@ func newKronk(mp models.Path) (*kronk.Kronk, error) {
 		fmt.Println("- nGPULayers     :", *n)
 	} else {
 		fmt.Println("- nGPULayers     : all")
+	}
+	if sm := krn.ModelConfig().PtrSplitMode; sm != nil {
+		fmt.Println("- splitMode      :", sm)
+	} else {
+		fmt.Println("- splitMode      : auto")
 	}
 
 	return krn, nil
@@ -3179,6 +3221,7 @@ func newKronk(mp models.Path) (*kronk.Kronk, error) {
 
 	krn, err := kronk.New(
 		model.WithModelFiles(mp.ModelFiles),
+		model.WithAutoTune(true),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("unable to create inference model: %w", err)
@@ -3457,6 +3500,7 @@ func newKronk(mp models.Path) (*kronk.Kronk, error) {
 
 	krn, err := kronk.New(
 		model.WithModelFiles(mp.ModelFiles),
+		model.WithAutoTune(true),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("unable to create reranker model: %w", err)
@@ -3487,6 +3531,11 @@ func newKronk(mp models.Path) (*kronk.Kronk, error) {
 		fmt.Println("- nGPULayers     :", *n)
 	} else {
 		fmt.Println("- nGPULayers     : all")
+	}
+	if sm := krn.ModelConfig().PtrSplitMode; sm != nil {
+		fmt.Println("- splitMode      :", sm)
+	} else {
+		fmt.Println("- splitMode      : auto")
 	}
 
 	return krn, nil
@@ -3638,6 +3687,7 @@ func newKronk(mp models.Path) (*kronk.Kronk, error) {
 
 	krn, err := kronk.New(
 		model.WithModelFiles(mp.ModelFiles),
+		model.WithAutoTune(true),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("unable to create inference model: %w", err)
@@ -3667,6 +3717,11 @@ func newKronk(mp models.Path) (*kronk.Kronk, error) {
 		fmt.Println("- nGPULayers     :", *n)
 	} else {
 		fmt.Println("- nGPULayers     : all")
+	}
+	if sm := krn.ModelConfig().PtrSplitMode; sm != nil {
+		fmt.Println("- splitMode      :", sm)
+	} else {
+		fmt.Println("- splitMode      : auto")
 	}
 
 	return krn, nil
@@ -3988,6 +4043,7 @@ func newKronk(mp models.Path) (*kronk.Kronk, error) {
 	krn, err := kronk.New(
 		model.WithModelFiles(mp.ModelFiles),
 		model.WithProjFile(mp.ProjFile),
+		model.WithAutoTune(true),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("unable to create inference model: %w", err)
@@ -4017,6 +4073,11 @@ func newKronk(mp models.Path) (*kronk.Kronk, error) {
 		fmt.Println("- nGPULayers     :", *n)
 	} else {
 		fmt.Println("- nGPULayers     : all")
+	}
+	if sm := krn.ModelConfig().PtrSplitMode; sm != nil {
+		fmt.Println("- splitMode      :", sm)
+	} else {
+		fmt.Println("- splitMode      : auto")
 	}
 
 	return krn, nil
